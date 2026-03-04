@@ -1,7 +1,5 @@
 import os
 import uuid
-import shutil
-import subprocess
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template
 from werkzeug.utils import secure_filename
@@ -16,6 +14,22 @@ OUTPUT_FOLDER.mkdir(exist_ok=True)
 ALLOWED_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "wma"}
 MAX_CONTENT_LENGTH = 200 * 1024 * 1024  # 200 MB
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+
+# Lazy-load spleeter so it doesn't crash at import time
+_separator_vocals = None
+_separator_instrumental = None
+
+def get_separator(mode):
+    global _separator_vocals, _separator_instrumental
+    from spleeter.separator import Separator
+    if mode == "vocals":
+        if _separator_vocals is None:
+            _separator_vocals = Separator("spleeter:2stems")
+        return _separator_vocals
+    else:
+        if _separator_instrumental is None:
+            _separator_instrumental = Separator("spleeter:2stems")
+        return _separator_instrumental
 
 
 def allowed_file(filename):
@@ -48,76 +62,48 @@ def separate():
     file.save(input_path)
 
     out_dir = OUTPUT_FOLDER / job_id
-    out_dir.mkdir(exist_ok=True)
 
     try:
-        # Run Demucs — htdemucs model separates: vocals, drums, bass, other
-        result = subprocess.run(
-            [
-                "python", "-m", "demucs",
-                "--two-stems", "vocals",   # only split vocals vs. no-vocals
-                "-n", "htdemucs",          # best quality model
-                "--out", str(out_dir),
-                str(input_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 min max
-        )
+        separator = get_separator(mode)
 
-        if result.returncode != 0:
-            return jsonify({
-                "error": "Separation failed",
-                "details": result.stderr[-1000:],
-            }), 500
+        # Spleeter outputs to: out_dir/<stem_name>/vocals.wav + accompaniment.wav
+        separator.separate_to_file(str(input_path), str(out_dir))
 
-        # Demucs outputs to: out_dir/htdemucs/<stem_name>/<vocals.wav or no_vocals.wav>
         stem_name = input_path.stem
-        model_out = out_dir / "htdemucs" / stem_name
-
-        vocals_file = model_out / "vocals.wav"
-        no_vocals_file = model_out / "no_vocals.wav"
+        stem_dir = out_dir / stem_name
 
         if mode == "vocals":
-            if not vocals_file.exists():
-                return jsonify({"error": "Vocals file not found after separation"}), 500
-            output_path = vocals_file
+            output_path = stem_dir / "vocals.wav"
         else:
-            if not no_vocals_file.exists():
-                return jsonify({"error": "Instrumental file not found after separation"}), 500
-            output_path = no_vocals_file
+            output_path = stem_dir / "accompaniment.wav"
+
+        if not output_path.exists():
+            return jsonify({"error": f"Output file not found: {output_path}"}), 500
+
+        dl_name = f"{Path(filename).stem}_{'vocals' if mode == 'vocals' else 'instrumental'}.wav"
 
         return send_file(
             str(output_path),
             as_attachment=True,
-            download_name=f"{Path(filename).stem}_{'vocals' if mode == 'vocals' else 'instrumental'}.wav",
+            download_name=dl_name,
             mimetype="audio/wav",
         )
-
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Processing timed out (file too large)"}), 504
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     finally:
-        # Cleanup input
         if input_path.exists():
             input_path.unlink()
 
 
 @app.route("/health")
 def health():
-    """Check if demucs is installed."""
-    result = subprocess.run(
-        ["python", "-m", "demucs", "--help"],
-        capture_output=True, text=True
-    )
-    ok = result.returncode == 0
-    return jsonify({
-        "status": "ok" if ok else "demucs_missing",
-        "demucs_available": ok,
-    })
+    try:
+        from spleeter.separator import Separator
+        return jsonify({"status": "ok", "spleeter": True})
+    except ImportError:
+        return jsonify({"status": "spleeter_missing", "spleeter": False})
 
 
 if __name__ == "__main__":
