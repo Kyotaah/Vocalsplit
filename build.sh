@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-echo ">>> Installing torch CPU-only first..."
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-echo ">>> Installing demucs..."
-pip install demucs --no-build-isolation
-
-echo ">>> Installing Flask..."
-pip install flask werkzeug
+echo ">>> Installing dependencies..."
+pip install flask werkzeug spleeter
 
 echo ">>> Build complete."
